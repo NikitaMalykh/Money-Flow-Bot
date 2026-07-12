@@ -16,6 +16,7 @@ import logging
 import asyncio
 import sqlite3
 import os
+import re
 
 
 load_dotenv()
@@ -258,7 +259,7 @@ def is_slot_taken(date: str, time: str, duration: int = 0,
 def get_user_bookings(user_id: int) -> List[Tuple]:
     return db_fetchall(
         'SELECT id, services, master, date, time, name, phone, status, comment '
-        'FROM bookings WHERE user_id = ? ORDER BY date, time',
+        'FROM bookings WHERE user_id = ? ORDER BY date DESC, time DESC',
         (user_id,)
     )
 
@@ -947,9 +948,9 @@ async def start_booking(message: types.Message, state: FSMContext):
 @dp.message(Booking.choose_gender)
 async def process_gender(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    if text == "👨 Мужчина":
+    if "мужчина" in text.lower():
         gender = "male"
-    elif text == "👩 Женщина":
+    elif "женщина" in text.lower():
         gender = "female"
     else:
         await message.answer(
@@ -1005,6 +1006,7 @@ async def process_services(message: types.Message, state: FSMContext):
                 reply_markup=get_services_keyboard(gender, selected),
                 parse_mode="HTML"
             )
+            await state.set_state(Booking.choose_services)
             return
         await state.update_data(selected_services=selected)
         if is_edit:
@@ -1165,8 +1167,15 @@ async def process_time(message: types.Message, state: FSMContext):
         booking_time = datetime.strptime(time_input, '%H:%M').time()
         formatted_time = booking_time.strftime('%H:%M')
 
-        if (booking_time.hour < WORKING_HOURS_START or
-                booking_time.hour >= WORKING_HOURS_END):
+        user_data = await state.get_data()
+        gender = user_data.get('gender', 'male')
+        selected_set = user_data.get('selected_services', set())
+        _, duration = get_services_list(gender, selected_set)
+
+        start_min = booking_time.hour * 60 + booking_time.minute
+        end_min = start_min + duration
+
+        if start_min < WORKING_HOURS_START * 60 or end_min > WORKING_HOURS_END * 60:
             await message.answer(
                 f"⚠️ <b>Мы работаем с {WORKING_HOURS_START}:00 "
                 f"до {WORKING_HOURS_END}:00!</b>\n"
@@ -1199,9 +1208,6 @@ async def process_time(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
     booking_date = user_data.get('date')
     is_edit = user_data.get('is_edit', False)
-    gender = user_data.get('gender', 'male')
-    selected_set = user_data.get('selected_services', set())
-    _, duration = get_services_list(gender, selected_set)
 
     if is_slot_taken(booking_date, formatted_time, duration):
         await message.answer(
@@ -1252,19 +1258,17 @@ async def process_contacts(message: types.Message, state: FSMContext):
 
     name = parts[0]
     phone = parts[1].strip()
-    clean_phone = ''.join(c for c in phone if c.isdigit() or c == '+')
-    digits_only = ''.join(c for c in clean_phone if c.isdigit())
 
-    if len(digits_only) < 10:
+    if not re.fullmatch(r'8[0-9]{10}', phone):
         await message.answer(
-            "❌ <b>Неверный номер телефона!</b>\n"
-            "Введите номер из хотя бы 10 цифр:",
+            "❌ <b>Неверный формат телефона!</b>\n"
+            "Введите 11 цифр, начиная с 8. Пример: <code>89001234567</code>",
             reply_markup=get_cancel_keyboard(),
             parse_mode="HTML"
         )
         return
 
-    await state.update_data(name=name, phone=clean_phone)
+    await state.update_data(name=name, phone=phone)
     user_data = await state.get_data()
     is_edit = user_data.get('is_edit', False)
 
@@ -1512,18 +1516,11 @@ async def process_cancel_callback(callback: types.CallbackQuery):
 
 @dp.message()
 async def unknown_message(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state:
-        await message.answer(
-            "⚠️ Я не понимаю это сообщение в текущем контексте.\n"
-            "Пожалуйста, следуйте инструкциям или отправьте /cancel для отмены."
-        )
-    else:
-        await message.answer(
-            "🤔 Я не понял команду.\n\n"
-            "Используйте кнопки меню или отправьте /help для списка команд.",
-            reply_markup=get_main_keyboard()
-        )
+    await message.answer(
+        "🤔 Я не понял команду.\n\n"
+        "Используйте кнопки меню или отправьте /help для списка команд.",
+        reply_markup=get_main_keyboard()
+    )
 
 
 async def main():
