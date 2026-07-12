@@ -220,3 +220,8 @@ __marimo__/
 # Data base
 *.db
 *.db-journal
+
+.env
+__pycache__/
+*.pyc
+venv/
