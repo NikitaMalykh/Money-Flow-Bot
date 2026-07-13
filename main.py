@@ -15,6 +15,7 @@ import calendar
 import logging
 import asyncio
 import sqlite3
+import threading
 import os
 import re
 
@@ -23,6 +24,7 @@ load_dotenv()
 
 API_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
+ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
 
 if not API_TOKEN:
     raise ValueError("BOT_TOKEN not set in .env")
@@ -33,6 +35,14 @@ try:
     ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
 except ValueError:
     raise ValueError("ADMIN_CHAT_ID must be a number")
+
+if ADMIN_USER_ID:
+    try:
+        ADMIN_USER_ID = int(ADMIN_USER_ID)
+    except ValueError:
+        raise ValueError("ADMIN_USER_ID must be a number")
+else:
+    ADMIN_USER_ID = ADMIN_CHAT_ID
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,21 +56,27 @@ MONTHS = ["", "Январь", "Февраль", "Март", "Апрель", "М�
           "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
 DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
+DEFAULT_SLOT_DURATION = 30
+TELEGRAM_MAX_LENGTH = 4000
+
+_db_lock = threading.Lock()
+
 
 # Database helpers
 
-def get_db():
-    return sqlite3.connect(DB_NAME)
-
-
 @contextmanager
 def db_cursor():
-    conn = sqlite3.connect(DB_NAME)
-    try:
-        yield conn.cursor()
-        conn.commit()
-    finally:
-        conn.close()
+    with _db_lock:
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute('PRAGMA journal_mode=WAL')
+        try:
+            yield conn.cursor()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def db_fetchall(query: str, params: tuple = ()) -> List[Tuple]:
@@ -110,10 +126,25 @@ def init_db():
     logger.info("Database initialized")
 
 
+def _booking_columns(c) -> List[str]:
+    c.execute("PRAGMA table_info(bookings)")
+    return [col[1] for col in c.fetchall()]
+
+
 def migrate_db():
     with db_cursor() as c:
-        c.execute("PRAGMA table_info(bookings)")
-        columns = [col[1] for col in c.fetchall()]
+        columns = _booking_columns(c)
+
+        if 'services' not in columns and 'service' in columns:
+            c.execute('ALTER TABLE bookings RENAME COLUMN service TO services')
+            columns = _booking_columns(c)
+            logger.info("Migration: renamed service to services")
+
+        if 'service' in columns and 'services' in columns:
+            c.execute(
+                'UPDATE bookings SET services = COALESCE(NULLIF(services, ""), service)'
+            )
+            logger.info("Migration: copied service data to services")
 
         migrations = [
             ('user_id', 'ALTER TABLE bookings ADD COLUMN user_id INTEGER'),
@@ -126,24 +157,20 @@ def migrate_db():
             ('duration', 'ALTER TABLE bookings ADD COLUMN duration INTEGER DEFAULT 0'),
         ]
         for col, sql in migrations:
-            if col not in columns:
+            if col not in _booking_columns(c):
                 c.execute(sql)
                 logger.info(f"Migration: added {col}")
 
-        if 'created_at' in columns:
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            c.execute(
-                'UPDATE bookings SET created_at = ? WHERE created_at IS NULL', (now,))
-
         for col in ['reminder_24h_sent', 'reminder_3h_sent', 'reminder_1_5h_sent']:
-            if col not in columns:
+            if col not in _booking_columns(c):
                 c.execute(
                     f'ALTER TABLE bookings ADD COLUMN {col} INTEGER DEFAULT 0')
                 logger.info(f"Migration: added {col}")
 
-        if 'services' not in columns and 'service' in columns:
-            c.execute('ALTER TABLE bookings RENAME COLUMN service TO services')
-            logger.info("Migration: renamed service to services")
+        if 'created_at' in _booking_columns(c):
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            c.execute(
+                'UPDATE bookings SET created_at = ? WHERE created_at IS NULL', (now,))
 
         c.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
@@ -188,13 +215,33 @@ def delete_user_data(user_id: int):
     db_execute('DELETE FROM users WHERE user_id = ?', (user_id,))
 
 
+def format_gender(gender: Optional[str]) -> str:
+    if gender == 'male':
+        return 'Мужчина'
+    if gender == 'female':
+        return 'Женщина'
+    return gender or '—'
+
+
+def to_services_set(selected) -> Set[str]:
+    if isinstance(selected, list):
+        return set(selected)
+    if isinstance(selected, set):
+        return selected
+    return set()
+
+
+def to_services_list(selected) -> List[str]:
+    return list(to_services_set(selected))
+
+
 def format_personal_row(row: Tuple) -> str:
     name, phone, gender, services, master, d, t, comment, status = row
     lines = [
         f"🆔 Запись",
         f"   👤 Имя: {name}",
         f"   📞 Телефон: {phone}",
-        f"   {'👨' if gender == 'male' else '👩'} Пол: {gender}",
+        f"   {'👨' if gender == 'male' else '👩'} Пол: {format_gender(gender)}",
         f"   💼 Услуги: {services}",
         f"   👤 Мастер: {master}",
         f"   📅 Дата: {d}",
@@ -222,12 +269,13 @@ def get_user_personal_data(user_id: int) -> str:
 def add_booking(user_id: int, gender: str, services: str, master: str,
                 date: str, time: str, name: str, phone: str,
                 comment: str = "", duration: int = 0) -> int:
+    created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with db_cursor() as c:
         c.execute(
-            'INSERT INTO bookings (user_id, gender, services, master, date, time, name, phone, comment, duration) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO bookings (user_id, gender, services, master, date, time, name, phone, comment, duration, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (user_id, gender, services, master, date,
-             time, name, phone, comment, duration)
+             time, name, phone, comment, duration, created_at)
         )
         return c.lastrowid
 
@@ -250,7 +298,8 @@ def is_slot_taken(date: str, time: str, duration: int = 0,
 
     for t, d in db_fetchall(query, params):
         start_existing = time_to_minutes(t)
-        end_existing = start_existing + d
+        effective_duration = d if d > 0 else DEFAULT_SLOT_DURATION
+        end_existing = start_existing + effective_duration
         if start_new < end_existing and start_existing < end_new:
             return True
     return False
@@ -358,9 +407,9 @@ def get_gender_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def get_services_keyboard(gender: str, selected: Set[str] = None) -> ReplyKeyboardMarkup:
+def get_services_keyboard(gender: str, selected=None) -> ReplyKeyboardMarkup:
     services = MALE_SERVICES if gender == "male" else FEMALE_SERVICES
-    selected = selected or set()
+    selected = to_services_set(selected)
     buttons = []
     row = []
     for i, (display, (name, _)) in enumerate(services.items()):
@@ -554,7 +603,7 @@ def get_services_list(gender: str, selected_names: Set[str]) -> Tuple[str, int]:
 
 def build_booking_summary(data: dict, header: str = "📋 <b>Ваши данные:</b>\n") -> str:
     gender = data.get('gender', 'male')
-    selected = data.get('selected_services', set())
+    selected = to_services_set(data.get('selected_services', []))
     services_str, total_time = get_services_list(gender, selected)
     master = data.get('master', 'Любой')
     date_val = data.get('date', 'Не указана')
@@ -603,7 +652,32 @@ def format_booking(row: Tuple, admin: bool = False) -> str:
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_CHAT_ID
+    return user_id == ADMIN_USER_ID
+
+
+def split_message(text: str, max_len: int = TELEGRAM_MAX_LENGTH) -> List[str]:
+    if len(text) <= max_len:
+        return [text]
+    parts = []
+    while text:
+        if len(text) <= max_len:
+            parts.append(text)
+            break
+        split_at = text.rfind('\n', 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        parts.append(text[:split_at])
+        text = text[split_at:].lstrip('\n')
+    return parts
+
+
+async def answer_long(message: types.Message, text: str, **kwargs):
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        send_kwargs = dict(kwargs)
+        if i < len(chunks) - 1:
+            send_kwargs.pop('reply_markup', None)
+        await message.answer(chunk, **send_kwargs)
 
 
 def get_reminder_time(appointment_dt: datetime, delta_hours: float) -> datetime:
@@ -718,8 +792,11 @@ async def require_admin(message: types.Message) -> bool:
     return True
 
 
-async def show_summary(message: types.Message, state: FSMContext, edit_mode: bool = False):
+async def show_summary(message: types.Message, state: FSMContext,
+                       edit_mode: Optional[bool] = None):
     user_data = await state.get_data()
+    if edit_mode is None:
+        edit_mode = user_data.get('is_edit', False)
     text = build_booking_summary(user_data)
 
     if edit_mode:
@@ -734,20 +811,47 @@ async def show_summary(message: types.Message, state: FSMContext, edit_mode: boo
 
 async def finalize_booking(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
-    user_id = message.from_user.id
+
+    if user_data.get('submitting'):
+        return
 
     if not await require_consent(message, state):
         return
 
+    await state.update_data(submitting=True)
+    user_data = await state.get_data()
+    user_id = message.from_user.id
+
     gender = user_data.get('gender', 'male')
-    selected = user_data.get('selected_services', set())
+    selected = to_services_set(user_data.get('selected_services', []))
     services_str, total_time = get_services_list(gender, selected)
     master = user_data.get('master', 'Любой')
-    date_val = user_data.get('date', 'Не указана')
-    time_val = user_data.get('time', 'Не указано')
-    name = user_data.get('name', 'Не указано')
-    phone = user_data.get('phone', 'Не указан')
+    date_val = user_data.get('date')
+    time_val = user_data.get('time')
+    name = user_data.get('name')
+    phone = user_data.get('phone')
     comment = user_data.get('comment', '')
+
+    if not selected or not date_val or not time_val or not name or not phone:
+        await state.update_data(submitting=False)
+        await message.answer(
+            "❌ <b>Не все данные заполнены.</b> Пожалуйста, начните запись заново.",
+            reply_markup=get_main_keyboard(),
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+
+    if is_slot_taken(date_val, time_val, total_time):
+        await state.update_data(submitting=False, is_edit=True)
+        await message.answer(
+            f"😔 <b>К сожалению, время {time_val} на {date_val} уже занято.</b>\n\n"
+            f"Пожалуйста, выберите другое время:",
+            reply_markup=get_cancel_keyboard(),
+            parse_mode="HTML"
+        )
+        await state.set_state(Booking.choose_time)
+        return
 
     try:
         booking_id = add_booking(
@@ -803,12 +907,14 @@ async def finalize_booking(message: types.Message, state: FSMContext):
 
     except Exception:
         logger.error("Database error during booking")
+        await state.update_data(submitting=False)
         await message.answer(
             "❌ <b>Произошла ошибка при сохранении записи.</b>\n"
             "Пожалуйста, попробуйте позже или свяжитесь с администратором.",
             reply_markup=get_main_keyboard(),
             parse_mode="HTML"
         )
+        return
 
     await state.clear()
 
@@ -967,7 +1073,7 @@ async def process_gender(message: types.Message, state: FSMContext):
     if is_edit:
         old_gender = user_data.get('gender', 'male')
         if old_gender != gender:
-            await state.update_data(gender=gender, selected_services=set())
+            await state.update_data(gender=gender, selected_services=[])
             await message.answer(
                 "⚠️ <b>Пол изменён — выбор услуг сброшен.</b>\n"
                 "💈 Выберите услуги заново:",
@@ -977,9 +1083,9 @@ async def process_gender(message: types.Message, state: FSMContext):
             await state.set_state(Booking.choose_services)
         else:
             await state.update_data(gender=gender)
-            await show_summary(message, state, edit_mode=True)
+            await show_summary(message, state)
     else:
-        await state.update_data(gender=gender, selected_services=set())
+        await state.update_data(gender=gender, selected_services=[])
         await message.answer(
             "💈 <b>Выберите услуги</b> (можно несколько):\n\n"
             "Нажимайте на услуги, чтобы выбрать/убрать. "
@@ -995,7 +1101,7 @@ async def process_services(message: types.Message, state: FSMContext):
     text = message.text.strip()
     user_data = await state.get_data()
     gender = user_data.get('gender', 'male')
-    selected = user_data.get('selected_services', set())
+    selected = to_services_set(user_data.get('selected_services', []))
     services = MALE_SERVICES if gender == "male" else FEMALE_SERVICES
     is_edit = user_data.get('is_edit', False)
 
@@ -1008,9 +1114,9 @@ async def process_services(message: types.Message, state: FSMContext):
             )
             await state.set_state(Booking.choose_services)
             return
-        await state.update_data(selected_services=selected)
+        await state.update_data(selected_services=to_services_list(selected))
         if is_edit:
-            await show_summary(message, state, edit_mode=True)
+            await show_summary(message, state)
         else:
             await message.answer(
                 "👤 <b>Выберите мастера:</b>\n\n"
@@ -1034,7 +1140,7 @@ async def process_services(message: types.Message, state: FSMContext):
             selected.remove(service_name)
         else:
             selected.add(service_name)
-        await state.update_data(selected_services=selected)
+        await state.update_data(selected_services=to_services_list(selected))
         await message.answer(
             "💈 <b>Выберите услуги</b> (можно несколько):\n\n"
             f"Выбрано: <b>{len(selected)}</b>",
@@ -1070,7 +1176,7 @@ async def process_master(message: types.Message, state: FSMContext):
     await state.update_data(master=master)
 
     if is_edit:
-        await show_summary(message, state, edit_mode=True)
+        await show_summary(message, state)
     else:
         today = date.today()
         await message.answer(
@@ -1116,16 +1222,22 @@ async def process_calendar_callback(callback: types.CallbackQuery, state: FSMCon
             return
 
         formatted = selected.strftime("%d.%m.%Y")
-        await state.update_data(date=formatted)
         user_data = await state.get_data()
         is_edit = user_data.get('is_edit', False)
+        update = {'date': formatted}
+        if is_edit:
+            update['old_date'] = user_data.get(
+                'old_date', user_data.get('date'))
+        await state.update_data(**update)
+        user_data = await state.get_data()
 
         if is_edit:
             old_date = user_data.get('old_date')
             old_time = user_data.get('time')
             if old_date != formatted and old_time:
                 gender = user_data.get('gender', 'male')
-                selected_set = user_data.get('selected_services', set())
+                selected_set = to_services_set(
+                    user_data.get('selected_services', []))
                 _, duration = get_services_list(gender, selected_set)
                 if is_slot_taken(formatted, old_time, duration):
                     await callback.message.answer(
@@ -1137,7 +1249,7 @@ async def process_calendar_callback(callback: types.CallbackQuery, state: FSMCon
                     await state.set_state(Booking.choose_time)
                     await callback.answer()
                     return
-            await show_summary(callback.message, state, edit_mode=True)
+            await show_summary(callback.message, state)
         else:
             await callback.message.answer(
                 f"📅 Дата: <b>{formatted}</b>\n\n"
@@ -1169,7 +1281,7 @@ async def process_time(message: types.Message, state: FSMContext):
 
         user_data = await state.get_data()
         gender = user_data.get('gender', 'male')
-        selected_set = user_data.get('selected_services', set())
+        selected_set = to_services_set(user_data.get('selected_services', []))
         _, duration = get_services_list(gender, selected_set)
 
         start_min = booking_time.hour * 60 + booking_time.minute
@@ -1222,7 +1334,7 @@ async def process_time(message: types.Message, state: FSMContext):
     await state.update_data(time=formatted_time)
 
     if is_edit:
-        await show_summary(message, state, edit_mode=True)
+        await show_summary(message, state)
     else:
         await message.answer(
             f"🕐 Время: <b>{formatted_time}</b>\n\n"
@@ -1273,7 +1385,7 @@ async def process_contacts(message: types.Message, state: FSMContext):
     is_edit = user_data.get('is_edit', False)
 
     if is_edit:
-        await show_summary(message, state, edit_mode=True)
+        await show_summary(message, state)
     else:
         await message.answer(
             "💬 <b>Хотите добавить комментарий к записи?</b>\n\n"
@@ -1289,7 +1401,7 @@ async def process_contacts(message: types.Message, state: FSMContext):
 @dp.message(Booking.enter_comment, F.text == "⏩ Пропустить")
 async def skip_comment(message: types.Message, state: FSMContext):
     await state.update_data(comment="")
-    await show_summary(message, state, edit_mode=True)
+    await show_summary(message, state)
 
 
 @dp.message(Booking.enter_comment, F.text == "💬 Добавить комментарий")
@@ -1305,7 +1417,7 @@ async def ask_comment_text(message: types.Message, state: FSMContext):
 async def process_comment(message: types.Message, state: FSMContext):
     comment = message.text.strip()
     await state.update_data(comment=comment)
-    await show_summary(message, state, edit_mode=True)
+    await show_summary(message, state)
 
 
 EDIT_ACTIONS = {
@@ -1317,9 +1429,9 @@ EDIT_ACTIONS = {
     "✏️ Изменить услуги": lambda ud: (
         Booking.choose_services,
         "💈 <b>Выберите услуги</b> (можно несколько):\n\n"
-        f"Выбрано: <b>{len(ud.get('selected_services', set()))}</b>",
+        f"Выбрано: <b>{len(to_services_set(ud.get('selected_services', [])))}</b>",
         get_services_keyboard(ud.get('gender', 'male'),
-                              ud.get('selected_services', set()))
+                              ud.get('selected_services', []))
     ),
     "✏️ Изменить мастера": lambda ud: (
         Booking.choose_master,
@@ -1366,7 +1478,10 @@ async def process_edit(message: types.Message, state: FSMContext):
 
     if action:
         new_state, msg, kb = action(user_data)
-        await state.update_data(is_edit=True)
+        update = {'is_edit': True}
+        if text == "✏️ Изменить дату":
+            update['old_date'] = user_data.get('date')
+        await state.update_data(**update)
         await message.answer(msg, reply_markup=kb, parse_mode="HTML")
         await state.set_state(new_state)
     else:
@@ -1413,8 +1528,8 @@ async def cmd_mybookings(message: types.Message):
         text += format_booking(row) + "\n"
 
     text += "\n💡 Чтобы отменить запись — свяжитесь с администратором"
-    await message.answer(
-        text, reply_markup=get_main_keyboard(), parse_mode="HTML"
+    await answer_long(
+        message, text, reply_markup=get_main_keyboard(), parse_mode="HTML"
     )
 
 
@@ -1423,7 +1538,7 @@ async def cmd_my_data(message: types.Message):
     if not await require_consent(message):
         return
     text = get_user_personal_data(message.from_user.id)
-    await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
+    await answer_long(message, text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
 @dp.message(Command('delete_my_data'))
@@ -1463,7 +1578,7 @@ async def cmd_admin(message: types.Message):
     for row in bookings:
         text += format_booking(row, admin=True) + "\n"
 
-    await message.answer(text, parse_mode="HTML")
+    await answer_long(message, text, parse_mode="HTML")
 
 
 @dp.message(Command('today'))
@@ -1484,7 +1599,7 @@ async def cmd_today(message: types.Message):
     for row in bookings:
         text += format_booking(row, admin=True) + "\n"
 
-    await message.answer(text, parse_mode="HTML")
+    await answer_long(message, text, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
