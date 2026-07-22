@@ -8,7 +8,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import Command, StateFilter
 from aiogram import Bot, Dispatcher, types, F
-from typing import Optional, List, Tuple, Set
+from typing import Optional, List, Tuple, Set, Literal
 from datetime import datetime, date, timedelta
 from contextlib import contextmanager
 import calendar
@@ -24,7 +24,6 @@ load_dotenv()
 
 API_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
-ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
 
 if not API_TOKEN:
     raise ValueError("BOT_TOKEN not set in .env")
@@ -35,14 +34,6 @@ try:
     ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
 except ValueError:
     raise ValueError("ADMIN_CHAT_ID must be a number")
-
-if ADMIN_USER_ID:
-    try:
-        ADMIN_USER_ID = int(ADMIN_USER_ID)
-    except ValueError:
-        raise ValueError("ADMIN_USER_ID must be a number")
-else:
-    ADMIN_USER_ID = ADMIN_CHAT_ID
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,17 +57,22 @@ _db_lock = threading.Lock()
 
 @contextmanager
 def db_cursor():
+    conn = None
     with _db_lock:
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute('PRAGMA journal_mode=WAL')
         try:
+            conn = sqlite3.connect(DB_NAME)
+            conn.execute('PRAGMA journal_mode=WAL')
             yield conn.cursor()
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logger.error(f"Database error: {e}")
+            raise
             raise
         finally:
-            conn.close()
+            if conn:
+                conn.close()
 
 
 def db_fetchall(query: str, params: tuple = ()) -> List[Tuple]:
@@ -236,7 +232,7 @@ def to_services_list(selected) -> List[str]:
 
 
 def format_personal_row(row: Tuple) -> str:
-    name, phone, gender, services, master, d, t, comment, status = row
+    name, phone, gender, services, master, date_val, time_val, comment, status = row
     lines = [
         f"🆔 Запись",
         f"   👤 Имя: {name}",
@@ -244,8 +240,8 @@ def format_personal_row(row: Tuple) -> str:
         f"   {'👨' if gender == 'male' else '👩'} Пол: {format_gender(gender)}",
         f"   💼 Услуги: {services}",
         f"   👤 Мастер: {master}",
-        f"   📅 Дата: {d}",
-        f"   🕐 Время: {t}",
+        f"   📅 Дата: {date_val}",
+        f"   🕐 Время: {time_val}",
         f"   📊 Статус: {status}",
     ]
     if comment:
@@ -281,8 +277,11 @@ def add_booking(user_id: int, gender: str, services: str, master: str,
 
 
 def time_to_minutes(t: str) -> int:
-    h, m = map(int, t.split(':'))
-    return h * 60 + m
+    try:
+        h, m = map(int, t.split(':'))
+        return h * 60 + m
+    except (ValueError, AttributeError):
+        return 0
 
 
 def is_slot_taken(date: str, time: str, duration: int = 0,
@@ -343,6 +342,10 @@ def get_active_bookings_for_reminders() -> List[Tuple]:
 
 
 def mark_reminder_sent(booking_id: int, column: str):
+    allowed_columns = {'reminder_24h_sent',
+                       'reminder_3h_sent', 'reminder_1_5h_sent'}
+    if column not in allowed_columns:
+        raise ValueError("Invalid column name")
     db_execute(f'UPDATE bookings SET {column} = 1 WHERE id = ?', (booking_id,))
 
 
@@ -376,7 +379,7 @@ FEMALE_SERVICES = {
 }
 
 WORKING_HOURS_START = 9
-WORKING_HOURS_END = 20
+WORKING_HOURS_END = 21
 
 
 # Keyboards
@@ -504,6 +507,42 @@ def get_reminder_inline_kb(booking_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def get_time_slider_keyboard(hour: int, minute: int, date_str: str, duration: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(
+            text=f"🕐 Текущее время: {hour:02d}:{minute:02d}", callback_data="time_slider:ignore"
+        )
+    ])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(
+            text=f"⬅️ {hour:02d} ➡️", callback_data="time_slider:hour_nav"
+        )
+    ])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(
+            text=f"⬆️ {minute:02d} ⬇️", callback_data="time_slider:minute_nav"
+        )
+    ])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(
+            text="✅ Всё верно, выбрать", callback_data=f"time_slider:confirm:{hour:02d}:{minute:02d}"
+        )
+    ])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад к списку", callback_data="time_slider:back_to_list"
+        )
+    ])
+
+    return kb
+
+
 def get_calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     kb.inline_keyboard.append([
@@ -591,7 +630,7 @@ dp = Dispatcher(storage=storage)
 # Helpers
 
 def get_services_list(gender: str, selected_names: Set[str]) -> Tuple[str, int]:
-    services = MALE_SERVICES if gender == "male" else FEMALE_SERVICES
+    services = MALE_SERVICES if gender == "male" else FEMALE_SERVICES if gender == "female" else {}
     names = []
     total_time = 0
     for display, (name, duration) in services.items():
@@ -652,7 +691,7 @@ def format_booking(row: Tuple, admin: bool = False) -> str:
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_USER_ID
+    return user_id == ADMIN_CHAT_ID
 
 
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LENGTH) -> List[str]:
@@ -728,15 +767,16 @@ REMINDER_CFG = [
 async def send_reminder(user_id: int, booking_id: int, services: str,
                         master: str, date_str: str, time_str: str,
                         name: str, hours_before: float):
-    text = REMINDER_TEMPLATES[hours_before](
-        name, date_str, time_str, services, master)
-    kb = get_reminder_inline_kb(booking_id) if hours_before == 1.5 else None
     try:
+        text = REMINDER_TEMPLATES[hours_before](
+            name, date_str, time_str, services, master)
+        kb = get_reminder_inline_kb(
+            booking_id) if hours_before == 1.5 else None
         await bot.send_message(
             chat_id=user_id, text=text, reply_markup=kb, parse_mode="HTML"
         )
-    except Exception:
-        logger.error("Failed to send reminder")
+    except Exception as e:
+        logger.error(f"Failed to send reminder: {e}")
 
 
 async def check_and_send_reminders():
@@ -768,8 +808,8 @@ async def reminder_loop():
     while True:
         try:
             await check_and_send_reminders()
-        except Exception:
-            logger.error("Reminder loop error")
+        except Exception as e:
+            logger.error(f"Reminder loop error: {e}")
         await asyncio.sleep(60)
 
 
@@ -813,6 +853,7 @@ async def finalize_booking(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
 
     if user_data.get('submitting'):
+        await state.update_data(submitting=False)
         return
 
     if not await require_consent(message, state):
@@ -882,8 +923,8 @@ async def finalize_booking(message: types.Message, state: FSMContext):
                 text="\n".join(admin_lines),
                 parse_mode="HTML"
             )
-        except Exception:
-            logger.error("Failed to notify admin")
+        except Exception as e:
+            logger.error(f"Failed to notify admin: {e}")
 
         client_lines = [
             "🎉 <b>Запись подтверждена!</b>\n",
@@ -905,8 +946,8 @@ async def finalize_booking(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
 
-    except Exception:
-        logger.error("Database error during booking")
+    except Exception as e:
+        logger.error(f"Database error during booking: {e}")
         await state.update_data(submitting=False)
         await message.answer(
             "❌ <b>Произошла ошибка при сохранении записи.</b>\n"
@@ -958,10 +999,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def process_consent_yes(callback: types.CallbackQuery):
     give_consent(callback.from_user.id)
     await callback.answer("Спасибо за согласие!")
-    await callback.message.edit_text(
-        "✅ <b>Согласие получено.</b>\n\nТеперь вы можете пользоваться всеми функциями бота.",
-        parse_mode="HTML"
-    )
+    try:
+        await callback.message.edit_text(
+            "✅ <b>Согласие получено.</b>\n\nТеперь вы можете пользоваться всеми функциями бота.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
     welcome_text = (
         "👋 <b>Добро пожаловать!</b>\n\n"
         "📝 Чтобы записаться — нажмите кнопку ниже\n"
@@ -1253,23 +1297,16 @@ async def process_calendar_callback(callback: types.CallbackQuery, state: FSMCon
         else:
             await callback.message.answer(
                 f"📅 Дата: <b>{formatted}</b>\n\n"
-                f"🕐 Укажите удобное время в формате <b>ЧЧ:ММ</b>\n"
-                f"Рабочие часы: с <b>{WORKING_HOURS_START}:00</b> "
-                f"до <b>{WORKING_HOURS_END}:00</b>\n"
-                f"Например: <code>15:30</code>",
+                f"🕐 Введите время в формате ЧЧ:ММ:",
                 reply_markup=get_cancel_keyboard(),
                 parse_mode="HTML"
             )
             await state.set_state(Booking.choose_time)
-        await callback.answer()
+    await callback.answer()
 
 
-@dp.message(Booking.choose_date)
-async def process_date(message: types.Message, state: FSMContext):
-    await message.answer(
-        "⚠️ Пожалуйста, выберите дату с помощью календаря выше.",
-        reply_markup=get_cancel_keyboard()
-    )
+
+
 
 
 @dp.message(Booking.choose_time)
@@ -1287,21 +1324,15 @@ async def process_time(message: types.Message, state: FSMContext):
         start_min = booking_time.hour * 60 + booking_time.minute
         end_min = start_min + duration
 
+        end_hour = end_min // 60
+        end_minute = end_min % 60
+
         if start_min < WORKING_HOURS_START * 60 or end_min > WORKING_HOURS_END * 60:
             await message.answer(
-                f"⚠️ <b>Мы работаем с {WORKING_HOURS_START}:00 "
-                f"до {WORKING_HOURS_END}:00!</b>\n"
-                f"Пожалуйста, выберите время в пределах рабочих часов:",
-                reply_markup=get_cancel_keyboard(),
-                parse_mode="HTML"
-            )
-            return
-
-        if booking_time.minute not in [0, 30]:
-            await message.answer(
-                "⚠️ <b>Запись возможна только каждые 30 минут</b> "
-                "(например, 10:00, 10:30, 11:00...)\n"
-                "Пожалуйста, укажите другое время:",
+                f"⚠️ <b>Абонент не укладывается в сроки!</b>\n"
+                f"Время окончания {end_hour:02d}:{end_minute:02d} выходит за пределы рабочих часов "
+                f"(с {WORKING_HOURS_START}:00 по {WORKING_HOURS_END}:00).\n\n"
+                f"Пожалуйста, запишитесь раньше:",
                 reply_markup=get_cancel_keyboard(),
                 parse_mode="HTML"
             )
@@ -1648,6 +1679,13 @@ async def main():
         types.BotCommand(command="mybookings", description="Мои записи"),
         types.BotCommand(command="help", description="Помощь"),
         types.BotCommand(command="cancel", description="Отменить действие"),
+        types.BotCommand(command="my_data", description="Ваши данные"),
+        types.BotCommand(command="delete_my_data",
+                         description="Удалить данные"),
+        types.BotCommand(command="withdraw_consent",
+                         description="Отозвать согласие"),
+        types.BotCommand(command="admin", description="Админка"),
+        types.BotCommand(command="today", description="Записи на сегодня"),
     ])
     await dp.start_polling(bot)
 
